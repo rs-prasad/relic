@@ -1,5 +1,5 @@
 import { readdir, readFile, stat, unlink } from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { createReadStream, type Dirent } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -111,6 +111,55 @@ async function* iterJsonlLines(filePath: string): AsyncGenerator<any> {
 	}
 }
 
+/**
+ * Sub-agent (Task tool) transcripts are written to
+ * `<projectDir>/<sessionId>/subagents/agent-*.jsonl`, not into the main
+ * `<sessionId>.jsonl`. Their assistant lines carry the same
+ * `message.usage` / `message.model` shape as the main thread, and the parent
+ * file never duplicates them (no `isSidechain` rows live there), so we fold
+ * their usage into the same per-model token map. Walk recursively so nested
+ * sub-agents are counted too.
+ */
+async function collectSubagentJsonl(dir: string): Promise<string[]> {
+	const out: string[] = [];
+	let entries: Dirent[];
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return out; // no subagents/ directory for this session
+	}
+	for (const e of entries) {
+		const full = join(dir, e.name);
+		if (e.isDirectory()) out.push(...(await collectSubagentJsonl(full)));
+		else if (e.isFile() && e.name.endsWith('.jsonl')) out.push(full);
+	}
+	return out;
+}
+
+async function addSubagentTokens(
+	projectDir: string,
+	sessionId: string,
+	tokensByModel: TokensByModel
+): Promise<void> {
+	const files = await collectSubagentJsonl(join(projectDir, sessionId, 'subagents'));
+	for (const filePath of files) {
+		try {
+			for await (const obj of iterJsonlLines(filePath)) {
+				if (!obj || typeof obj !== 'object') continue;
+				const o = obj as any;
+				if (o.type !== 'assistant') continue;
+				const u = extractUsage(o.message?.usage);
+				if (!isNonEmptyUsage(u)) continue;
+				const model = typeof o.message?.model === 'string' ? o.message.model : 'unknown';
+				if (!tokensByModel[model]) tokensByModel[model] = emptyModelTokens();
+				addUsage(tokensByModel[model], u);
+			}
+		} catch {
+			/* ignore unreadable sub-agent file */
+		}
+	}
+}
+
 function asTimestamp(s: unknown): number {
 	if (typeof s !== 'string') return 0;
 	const t = Date.parse(s);
@@ -206,6 +255,7 @@ export async function listProjects(): Promise<ProjectSummary[]> {
 				} catch {
 					/* ignore */
 				}
+				await addSubagentTokens(dir, f.replace(/\.jsonl$/, ''), tokensByModel);
 				totalMessages += lineCount;
 				totalUserMessages += userCount;
 			}
@@ -340,6 +390,7 @@ async function summarizeSession(
 			hasErrors = true;
 		}
 	}
+	await addSubagentTokens(join(HISTORY_DIR, projectId), sessionId, tokensByModel);
 	const idx = index?.get(sessionId);
 	const finalTitle = pickTitle(idx, customTitle, aiTitle);
 	return {
@@ -521,6 +572,7 @@ export async function getSession(
 			});
 		}
 	}
+	await addSubagentTokens(join(HISTORY_DIR, projectId), sessionId, tokensByModel);
 	events.sort((a, b) => a.timestamp - b.timestamp);
 	return {
 		sessionId,
